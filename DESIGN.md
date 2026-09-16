@@ -1,159 +1,172 @@
 # Design Document
 
-## 1. Architecture overview
+## 1. At a glance
 
-```
-POST /api/v1/orders  { courierPartner, ...normalized fields }
+```text
+Consumer
+  -> Express route
+  -> API-key auth + Zod validation
+  -> Controller
+  -> Order service
+  -> CourierRegistry.resolve(courierPartner)
+  -> UrbaneBoltAdapter | MockCourierAdapter
+  -> MongoDB: Order + TrackingEvent
 
-Express Router → apiKeyAuth → zod validate → Controller → Service
-                                                   │
-                                                   ▼
-                                   CourierRegistry.resolve(courierPartner)
-                                                   │
-                                    ┌──────────────┴───────────────┐
-                                    ▼                              ▼
-                          UrbaneBoltAdapter                MockCourierAdapter
-                          (real HTTP, retry/backoff,        (in-memory, bonus,
-                           token re-auth)                    proves pluggability)
-                                    │
-                                    ▼
-                         MongoDB: Order + TrackingEvent
-                                    │
-                         Bulk path: BullMQ (Redis) fan-out
-                         to the same Service/Adapter code
+Bulk requests: API -> BullMQ/Redis -> same Order service -> same adapters
 ```
 
-The unified API, DTOs, controllers, and services never know which courier is involved; they
-only see the `CourierAdapter` interface, resolved at runtime by a string key. This is a
-**Strategy pattern** (interchangeable `CourierAdapter` implementations behind one interface)
-combined with a **Factory/Registry** (`CourierRegistry`) that resolves the right strategy from
-the `courier_partner` field in the request. Adding a courier means writing one new adapter
-class and registering it in one composition-root file (`src/couriers/index.ts`) and no
-controller, route, DTO, or existing adapter is touched, satisfying the pluggability
-requirement literally.
+- One courier-agnostic API for consumers.
+- `courierPartner` selects the adapter at runtime.
+- UrbaneBolt is the real integration; MockCourier proves pluggability without network calls.
+- MongoDB stores current order state and tracking history.
+- BullMQ + Redis processes bulk orders asynchronously.
 
-## 2. Why this pattern
+## 2. Architecture decisions
 
-- **Testability**: business logic (`orders.service.ts`) is tested against `MockCourierAdapter`
-  without any network dependency.
-- **Isolation of courier-specific quirks**: UrbaneBolt's exact request/response field names live
-  in one mapper file (`urbanebolt.mapper.ts`); if/when the real schema needs correcting, nothing
-  else in the system changes.
-- **Uniform error handling**: every adapter throws the same internal `CourierError` shape
-  (`COURIER_REJECTED_REQUEST` / `COURIER_AUTH_FAILED` / `COURIER_UPSTREAM_ERROR`), translated by
-  one shared function (`courierErrorToAppError`) into the single normalized client-facing error
-  shape.
+### Strategy + Registry
 
-## 3. Database schema (MongoDB / Mongoose)
+- `CourierAdapter`: shared contract for `createShipment`, `trackShipment`, `cancelShipment`.
+- `CourierRegistry`: maps a partner key to an adapter instance.
+- `src/couriers/index.ts`: composition root; adapters are registered here.
+- Services/controllers never import a concrete courier.
 
-**`Order`** — one document per internal order, current-state snapshot:
-| Field | Notes |
+Adding a courier that uses the existing normalized order shape:
+
+1. Add adapter, mapper, config, and error mapping under `src/couriers/adapters/<name>/`.
+2. Implement `CourierAdapter`.
+3. Register it in `src/couriers/index.ts`.
+
+No route, controller, DTO, service, or existing adapter changes.
+
+### Adapter boundary
+
+```text
+our DTO
+  -> NormalizedOrderInput
+  -> courier mapper: our shape -> courier wire shape
+  -> courier HTTP API
+  -> courier mapper: courier response -> normalized result
+  -> Order service -> MongoDB/API response
+```
+
+- Courier-specific fields stay inside the adapter/mapper.
+- Courier errors become `CourierError`, then one normalized API error shape.
+- UrbaneBolt auth, retry, endpoint calls, and response mapping stay outside business logic.
+
+## 3. Persistence
+
+### `Order` - current state
+
+| Field | Purpose |
 |---|---|
-| `orderId` | unique index — the idempotency key |
-| `courierPartner` | which adapter handled this order |
-| `courierOrderId`, `awbNumber` | returned by the courier on creation |
-| `status` | `CREATED \| PICKED_UP \| IN_TRANSIT \| DELIVERED \| CANCELLED \| FAILED` |
-| `requestPayload`, `responsePayload` | full payload sent to/received from the courier on creation (audit/debugging, per assignment 3.3) |
-| `lastError` | `{ message, code, raw, occurredAt }` - set on any courier-call failure, without necessarily changing `status` (see trade-off below) |
-| `createdAt` / `updatedAt` | timestamps |
+| `orderId` | Internal ID; unique index and idempotency key |
+| `courierPartner` | Adapter used |
+| `courierOrderId`, `awbNumber` | IDs returned by courier |
+| `status` | `CREATED`, `PICKED_UP`, `IN_TRANSIT`, `DELIVERED`, `CANCELLED`, `FAILED` |
+| `requestPayload`, `responsePayload` | Full courier create request/response for audit/debugging |
+| `lastError` | Last courier-call failure: message, code, raw payload, timestamp |
+| `createdAt`, `updatedAt` | Mongoose timestamps |
 
-**`TrackingEvent`** — append-only, one row per status transition:
-`{ orderId, status, rawPayload, createdAt }`, indexed on `{ orderId, createdAt }`. Populated on
-every successful create/track/cancel call that changes the shipment's status — never on a
-transient call failure (see below).
+### `TrackingEvent` - append-only history
 
-**`BatchJob`** — one document per bulk submission: `{ batchId (unique), items: [{ orderId,
-courierPartner, status: PENDING|SUCCEEDED|FAILED, reason }] }`. Aggregate totals are computed
-on read from `items`, not stored redundantly, to avoid a second source of truth.
+```text
+{ orderId, status, rawPayload, createdAt }
+```
 
-### Status vs. tracking-event trade-off
-`Order.status = 'FAILED'` is reserved for a **creation** failure when the courier never accepted
-the shipment. A transient failure while calling `/track` or `/cancel` on an already-created order does **not** overwrite `Order.status` or append a `TrackingEvent` (that would incorrectly imply the shipment itself
-failed); it only sets `lastError` and returns an error to the caller. This was a deliberate
-design decision after considering a dedicated `CourierCallLog` audit table for every raw
-attempt; that was scoped out as over-engineering for this assignment (see below) in favor of
-this simpler two-table design.
+- Separate collection.
+- Indexed by `{ orderId, createdAt }`.
+- Added on successful status transitions from create/track/cancel.
+- Transient track/cancel failures update `lastError`, not shipment status/history.
+- Creation failure is stored as `FAILED` because the shipment was never accepted.
 
-## 4. Bulk processing (100 orders)
+### `BatchJob` - bulk state
 
-`POST /api/v1/orders/bulk` validates the payload (≤ `BULK_MAX_ORDERS`), creates a `BatchJob`
-with all items `PENDING`, enqueues one BullMQ job per order (`jobId = orderId`), and returns
-`202 { batchId }` **immediately** and orders are not processed inline in the HTTP request.
+```text
+{ batchId, items: [{ orderId, courierPartner, status, reason }] }
+```
 
-**Why `batchId` + polling, not streaming**: streaming (e.g. chunked responses or WebSockets)
-would keep one HTTP connection open for the whole batch and complicates client retry semantics
-if the connection drops mid-batch. Returning a `batchId` immediately and letting the client poll
-`GET /orders/bulk/:batchId` is simpler, resilient to client disconnects.
+- `batchId` is unique.
+- Item status: `PENDING`, `SUCCEEDED`, or `FAILED`.
+- Totals are calculated from items when status is requested.
 
-**Why BullMQ + Redis over an in-process worker pool**: an in-process concurrency limiter
-(e.g. `p-limit`) would be simpler (no extra infra) but isn't durable as a process crash mid-batch
-loses in-flight work, and it can't scale beyond one instance. BullMQ persists jobs in Redis,
-survives restarts, and gives concurrency control (`BULK_WORKER_CONCURRENCY`) and retained
-failed-job data.
+## 4. Bulk processing
 
-**Idempotency (two layers)**:
-1. `Order.orderId` has a unique index — `createOrder()` checks for an existing order first and
-   is a no-op (returns the existing document) if found. This is the permanent guarantee.
-2. BullMQ's `jobId = orderId` deduplicates jobs at the queue level, so resubmitting the same
-   batch (or the same order in a different batch) doesn't even enqueue a second job while the
-   first is in flight.
+`POST /api/v1/orders/bulk`:
 
-**Retry/backoff placement**: backoff for 5xx/timeout/network errors lives in one shared
-`RetryableHttpClient` used by every adapter, for both the synchronous single-order endpoints and
-the bulk worker. they are not duplicated as a second retry layer in BullMQ (BullMQ jobs use
-`attempts: 1`, since the HTTP client already retries before the job fails).
+1. Validate 1 to `BULK_MAX_ORDERS` orders.
+2. Create a `BatchJob` with all items `PENDING`.
+3. Enqueue one BullMQ job per order.
+4. Return `202` with `batchId` immediately.
+5. Worker processes jobs concurrently and updates each item.
+6. Consumer polls `GET /api/v1/orders/bulk/:batchId`.
+
+### Why this design
+
+| Decision | Reason |
+|---|---|
+| Batch ID + polling | No long-lived HTTP connection; client retries/polls safely |
+| BullMQ + Redis | Durable jobs, concurrency control, restart visibility, multi-worker scaling |
+| `jobId = orderId` | Queue-level duplicate protection |
+| Unique `Order.orderId` | Permanent database-level idempotency backstop |
+| HTTP retry, not BullMQ retry | One shared retry policy; BullMQ jobs use `attempts: 1` |
+
+Retryable courier failures: 5xx, timeout, and network errors. Backoff and attempt count are
+configuration-driven. Courier 4xx responses are not retried.
 
 ## 5. Error handling
 
-Single normalized shape on every response: `{ error: { code, message, details?, requestId } }`.
-- Validation (`zod`) → `400 VALIDATION_ERROR` with per-field `details`.
-- Unknown `courier_partner` → `400 UNKNOWN_COURIER_PARTNER` with `details.supportedCouriers`.
-- Courier 4xx → `400/502` normalized codes (`COURIER_REJECTED_ORDER`, `COURIER_AUTH_FAILED`,
-  `COURIER_UNAVAILABLE`); the courier's raw response is stored in `Order.lastError`/`requestPayload`
-  for our own debugging, never returned to the client.
-- Courier 5xx/timeout/network → retried with configurable exponential backoff, then surfaced as
-  `COURIER_UNAVAILABLE` and persisted (`Order.status = 'FAILED'` + `lastError` for creation
-  failures; `lastError` only for track/cancel failures — see trade-off above).
-- Auth failure (401 from courier) → one transparent re-authentication + one retry, inside the
-  adapter, invisible to the caller unless it also fails.
-- Courier failures are logged as structured JSON with `orderId`, `courierPartner`, `requestId`,
-  `errorType`, and `stack`. Generic HTTP failures log the context available at the error
-  boundary (`requestId`, `errorType`, `statusCode`, and `stack`).
+Every API error uses:
 
-## 6. Trade-offs & things intentionally left out of scope
+```json
+{ "error": { "code": "STRING_CODE", "message": "human readable", "details": {}, "requestId": "uuid" } }
+```
 
-- **No `CourierCallLog` audit table.** Considered logging every single outbound courier call
-  (including every retry attempt) as its own DB collection. Dropped as over-engineering: BullMQ
-  already retains failed-job data (payload + error + attempt count) for the bulk path, and the
-  structured pino logs satisfy "every failure must be logged with order_id/courier_partner/
-  request_id/error_type/stack trace" literally. A DB audit table would be the natural next step
-  if full replay of every attempt were required.
-- **No log aggregation/shipping.** Pino writes structured JSON to stdout; for this assignment,
-  `docker compose logs` is sufficient. Shipping to ELK/CloudWatch/etc. is out of scope.
-- **Single process for API + BullMQ worker.** Simpler to run and demo. Production can build one
-  image and run separate API and worker deployments with different entrypoints.
-- **UrbaneBolt schema completeness.** See README "Assumptions" — the UAT environment was down
-  and the Postman documentation page didn't fully render three endpoints. Payload field mapping
-  is isolated to `urbanebolt.mapper.ts`; endpoint paths/auth remain in the adapter and also need
-  confirmation against the live docs.
-- **No auth/rate-limiting beyond a static API key.** A single shared `x-api-key` was added since
-  the assignment didn't specify unified-API auth; a real production system would likely use
-  per-consumer keys/OAuth and rate limiting.
+| Failure | Behavior |
+|---|---|
+| Invalid input | `400 VALIDATION_ERROR` with field-level details |
+| Unknown courier | `400 UNKNOWN_COURIER_PARTNER` plus supported keys |
+| Courier 4xx | Normalized client error; raw response stays internal |
+| Courier 5xx/timeout/network | Retry with exponential backoff, then persist failure and return `COURIER_UNAVAILABLE` |
+| Courier 401 | Re-authenticate once, retry once |
+| Any courier failure | Structured Pino log with order ID, courier, request ID, error type, stack |
+| Generic HTTP failure | Global handler logs available request/error context |
 
-## 7. Running: dev vs. production
+Raw courier payloads are persisted for internal debugging, never returned directly to consumers.
 
-- Dev: `docker compose up -d mongo redis` (infra only) + `npm run dev` (tsx watch, hot reload) on
-  host. `.env` already points at `localhost:27017`/`6379` for this. Full-stack
-  `docker compose up --build` (app+mongo+redis) also works, no hot reload.
-- Bulk endpoint/worker needs Redis up; single order create/track/cancel only needs Mongo, not
-  Redis — degrades independently if Redis is down.
-- Prod build: `tsc` → `dist/*.js`, packaged into a Docker image (multi-stage `Dockerfile`
-  already does this) — no `ts-node`/`tsx` in prod, no PM2 needed since a container
-  orchestrator (k8s/ECS/Cloud Run) already handles restart-on-crash + replica scaling; PM2 is
-  only relevant on a bare VM with no orchestrator.
-- Prod topology: build one image, run it as two deployments — `node dist/server.js` (API,
-  scales on request traffic) and `node dist/worker.js` (BullMQ worker, scales on queue depth).
-  Today both run in `server.ts`; splitting needs a `worker.ts` entrypoint and a second service
-  or deployment, but no business-logic changes.
-- Managed Mongo (Atlas) + managed Redis (Elasticache/Upstash) replace the containerized
-  `mongo`/`redis` services; app only needs `MONGODB_URI`/`REDIS_URL` env vars updated.
+## 6. Trade-offs and scope
+
+- **No log aggregation:** Pino writes JSON to stdout; deployment infrastructure can ship it to
+  ELK, CloudWatch, Datadog, etc.
+- **One API + worker process:** simpler for the assignment/demo. Production can run separate API
+  and worker deployments from the same image for independent scaling and failure isolation.
+- **Static API key:** assignment did not specify unified-API auth. Production should use stronger
+  per-consumer credentials/OAuth and rate limiting.
+- **UrbaneBolt schema:** UAT was unavailable and three endpoint schemas did not render in the
+  Postman documentation. Payload mapping is in `urbanebolt.mapper.ts`; endpoint paths/auth are
+  in `urbanebolt.adapter.ts`. Confirm both against live docs before real traffic.
+
+## 7. Running model
+
+### Development
+
+```bash
+docker compose up -d mongo redis
+npm run dev
+```
+
+- Local `.env` uses `localhost:27017` and `localhost:6379`.
+- `tsx watch` provides hot reload.
+- Full container mode also works: `docker compose up --build`.
+- Bulk processing needs Redis. Single create/track/cancel needs Mongo, not Redis.
+
+### Production
+
+- `tsc` compiles TypeScript to `dist/*.js`.
+- Multi-stage Dockerfile packages compiled JS and production dependencies.
+- Use one image, then run separate entrypoints/deployments:
+  - `node dist/server.js` - HTTP API; scale by request traffic.
+  - `node dist/worker.js` - BullMQ worker; scale by queue depth.
+- Today both run from `server.ts`; splitting needs a worker entrypoint and deployment/service,
+  not business-logic changes.
+- Replace container Mongo/Redis with managed services such as Atlas and ElastiCache/Upstash;
+  update `MONGODB_URI` and `REDIS_URL` only.
