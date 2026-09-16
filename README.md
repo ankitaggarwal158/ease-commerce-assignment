@@ -1,7 +1,7 @@
 # Multi-Courier Integration Platform
 
-A courier-agnostic order/shipment backend. Consumers call **one unified REST API**; which
-courier actually ships the order is just a `courierPartner` string in the request body.
+A courier-agnostic order/shipment backend. Consumers call **one unified REST API**; the
+courier is selected with the `courierPartner` string in the request body.
 UrbaneBolt is the first live integration; a bonus in-memory `MockCourier` adapter proves the
 platform is truly pluggable.
 
@@ -39,8 +39,8 @@ npm run dev       # ts-node/tsx with hot reload
 # or
 npm run build && npm start   # compiled production build
 ```
-The API and the BullMQ bulk worker run in the same process for simplicity (see DESIGN.md
-trade-offs). Health check: `GET http://localhost:3000/health`.
+`npm run dev` runs the API and BullMQ worker in one process. Health check:
+`GET http://localhost:3000/health`.
 
 ### Run everything (app + Mongo + Redis) via Docker Compose
 ```bash
@@ -68,7 +68,9 @@ docker compose up --build
 
 ## API
 
-All endpoints below require header `x-api-key: <INTERNAL_API_KEY>` (except `/health`).
+All endpoints below require `x-api-key: <INTERNAL_API_KEY>` (except `/health`).
+The assignment calls this field `courier_partner`; this implementation uses camelCase
+`courierPartner`.
 Full request/response examples: [postman_collection.json](postman_collection.json) or curl below.
 
 ### Create an order
@@ -128,8 +130,8 @@ automated suite — see DESIGN.md for why.
 
 ## How to add a new courier
 
-Adding a courier requires **zero changes** to controllers, routes, DTOs, or any existing
-adapter/service code — only new files:
+For a courier that uses the existing normalized order shape, adding it requires no changes to
+controllers, routes, DTOs, services, or existing adapters:
 
 1. Create `src/couriers/adapters/<name>/<name>.adapter.ts` implementing the `CourierAdapter`
    interface (`createShipment`, `trackShipment`, `cancelShipment`) — see
@@ -142,22 +144,17 @@ adapter/service code — only new files:
    ```ts
    courierRegistry.register(new YourNewAdapter());
    ```
-That's it — consumers can now pass `"courierPartner": "yourNewCourier"` and everything else
-(persistence, bulk processing, error normalization, retries) works unchanged.
+Consumers can then pass `"courierPartner": "yourNewCourier"`; persistence, bulk processing,
+error normalization, and retries continue unchanged.
 
 ## Assumptions
 
 - **UrbaneBolt UAT availability**: the UAT environment (`uat.urbanebolt.in`) was returning
-  `503 Service Temporarily Unavailable` during development, and the Postman documentation page
-  didn't fully render the Manifest/Tracking/Cancellation request/response schemas for us. The
+  `503 Service Temporarily Unavailable` during development. The
   `UrbaneBoltAdapter`'s endpoint paths and payload field names in `urbanebolt.mapper.ts` are
   therefore a best-effort inference from the confirmed `getToken`/`Pincode` endpoint
-  conventions — isolated entirely to that one file. Confirm against the live Postman collection
-  before relying on real UrbaneBolt traffic.
+  conventions.
 - No API auth was specified by the assignment for the unified API itself; a simple
   `x-api-key` guard was added for a more production-realistic feel.
 - Automated tests weren't explicitly mandated by the assignment, but a focused suite was
   included as proof the pluggability/idempotency/error-handling requirements actually work.
-- The API + BullMQ worker run in a single process for this assignment's scope; splitting them
-  into separate deployable processes would be a one-line change (run `startBulkWorker()` in
-  its own entrypoint) for real horizontal scaling.
