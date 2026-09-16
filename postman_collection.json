@@ -1,0 +1,71 @@
+{
+  "info": {
+    "name": "Multi-Courier Integration Platform",
+    "description": "Unified courier-agnostic API. Import into Postman, or run the curl examples directly.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "apiKey", "value": "changeme-local-dev-key" }
+  ],
+  "item": [
+    {
+      "name": "Health check",
+      "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+    },
+    {
+      "name": "Create order (mockcourier)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": "{{baseUrl}}/api/v1/orders",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"orderId\": \"ORD-1001\",\n  \"courierPartner\": \"mockcourier\",\n  \"consignee\": {\n    \"name\": \"Alice\",\n    \"phone\": \"9000000001\",\n    \"addressLine1\": \"123 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"KA\",\n    \"pincode\": \"560001\"\n  },\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9000000002\",\n    \"addressLine1\": \"1 Depot Rd\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"KA\",\n    \"pincode\": \"560002\"\n  },\n  \"package\": { \"weightKg\": 1.5 },\n  \"payment\": { \"mode\": \"PREPAID\" }\n}"
+        }
+      }
+    },
+    {
+      "name": "Track order",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "x-api-key", "value": "{{apiKey}}" }],
+        "url": "{{baseUrl}}/api/v1/orders/ORD-1001/track"
+      }
+    },
+    {
+      "name": "Cancel order",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "x-api-key", "value": "{{apiKey}}" }],
+        "url": "{{baseUrl}}/api/v1/orders/ORD-1001/cancel"
+      }
+    },
+    {
+      "name": "Bulk create orders",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-api-key", "value": "{{apiKey}}" }
+        ],
+        "url": "{{baseUrl}}/api/v1/orders/bulk",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"orders\": [\n    {\n      \"orderId\": \"BULK-1\",\n      \"courierPartner\": \"mockcourier\",\n      \"consignee\": { \"name\": \"A\", \"phone\": \"9000000001\", \"addressLine1\": \"X\", \"city\": \"C\", \"state\": \"S\", \"pincode\": \"110001\" },\n      \"pickup\": { \"name\": \"W\", \"phone\": \"9000000002\", \"addressLine1\": \"Y\", \"city\": \"C\", \"state\": \"S\", \"pincode\": \"110002\" },\n      \"package\": { \"weightKg\": 1 },\n      \"payment\": { \"mode\": \"PREPAID\" }\n    },\n    {\n      \"orderId\": \"BULK-2\",\n      \"courierPartner\": \"urbanebolt\",\n      \"consignee\": { \"name\": \"B\", \"phone\": \"9000000001\", \"addressLine1\": \"X\", \"city\": \"C\", \"state\": \"S\", \"pincode\": \"110001\" },\n      \"pickup\": { \"name\": \"W\", \"phone\": \"9000000002\", \"addressLine1\": \"Y\", \"city\": \"C\", \"state\": \"S\", \"pincode\": \"110002\" },\n      \"package\": { \"weightKg\": 1 },\n      \"payment\": { \"mode\": \"PREPAID\" }\n    }\n  ]\n}"
+        }
+      }
+    },
+    {
+      "name": "Get bulk batch status",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "x-api-key", "value": "{{apiKey}}" }],
+        "url": "{{baseUrl}}/api/v1/orders/bulk/REPLACE_WITH_BATCH_ID"
+      }
+    }
+  ]
+}

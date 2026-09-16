@@ -1,0 +1,13 @@
+# Use this workspace to collaborate
+workspace:
+  id: 484f374f-9675-45f6-81cf-6e0f5717a9b1
+
+localResources:
+  collections:
+    - ../postman_collection.json
+
+# Each entry here maps a local resource to one or more corresponding objects in Postman Cloud
+
+cloudResources:
+  collections:
+    ../postman/collections/Multi-Courier Integration Platform: b6c4386d-1bc4-4350-9f44-60573fac4a56
